@@ -1,85 +1,100 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ------------------------------------------------------------------------------
 # Script Name : tr.sh
-# Description : Connects to multiple servers and ports to check if they are open
+# Description : Checks TCP connectivity for multiple hosts and ports.
 # Author      : Naxterra
 # Contact     : github@shades.systems
-# License     : GPL-3.0 license
+# License     : GPL-3.0-or-later
 # ------------------------------------------------------------------------------
-
+#
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 # See <https://www.gnu.org/licenses/gpl-3.0.html> for details.
 
-[ -n "$BASH_VERSION" ] || { echo "Please run this script with bash."; exit 1; }
+[ -n "${BASH_VERSION:-}" ] || { echo "Please run this script with bash." >&2; exit 1; }
+
+set -o nounset
+set -o pipefail
+
+VERSION="1.0.0"
+CONNECT_TIMEOUT="1"
+HOST_INPUT=""
+PORT_INPUT=""
+OPEN_ONLY=0
+USE_COLOR=1
+
+if [[ -n "${NO_COLOR:-}" || ! -t 1 ]]; then
+    USE_COLOR=0
+fi
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
+YELLOW='\033[1;33m'
 NC='\033[0m'
 
-expand_ip_range() {
-    local range=$1
-    local ips=()
+usage() {
+    cat <<'EOF'
+tr.sh - TCP reachability checker
 
-    IFS=',' read -ra ADDR <<< "$range"
-    for ip in "${ADDR[@]}"; do
-        if [[ $ip =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.([0-9]+)-([0-9]+)$ ]]; then
-            prefix="${BASH_REMATCH[1]}"
-            start="${BASH_REMATCH[2]}"
-            end="${BASH_REMATCH[3]}"
-            for ((i=start; i<=end; i++)); do
-                if (( i >= 0 && i <= 255 )); then
-                    ips+=("$prefix.$i")
-                fi
-            done
-        elif [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            ips+=("$ip")
-        else
-            echo "Warning: Skipping invalid IP format: $ip" >&2
-        fi
-    done
+Usage:
+  ./tr.sh [options]
 
-    echo "${ips[@]}"
+Options:
+  -H, --hosts HOSTS       Comma-separated hosts/IPs/ranges.
+                          Examples:
+                            192.168.1.10
+                            192.168.1.10-20
+                            192.168.1.10-192.168.1.20
+                            localhost,example.com
+
+  -p, --ports PORTS       Comma-separated ports/ranges.
+                          Examples:
+                            22,80,443
+                            8000-8010
+
+  -t, --timeout SECONDS   Per-connection timeout. Default: 1
+      --open-only         Show only open ports.
+      --no-color          Disable colored output.
+  -h, --help              Show this help message.
+  -v, --version           Show version.
+
+Interactive mode:
+  If --hosts or --ports are omitted, the script prompts for them.
+
+Examples:
+  ./tr.sh --hosts 192.168.1.1,192.168.1.10-20 --ports 22,80,443
+  ./tr.sh -H localhost,example.com -p 80,443 -t 2 --open-only
+EOF
 }
 
-expand_port_range() {
-    local range=$1
-    local ports=()
-
-    IFS=',' read -ra PR <<< "$range"
-    for p in "${PR[@]}"; do
-        if [[ $p =~ ^([0-9]+)-([0-9]+)$ ]]; then
-            for ((i=${BASH_REMATCH[1]}; i<=${BASH_REMATCH[2]}; i++)); do
-                if (( i >= 1 && i <= 65535 )); then
-                    ports+=("$i")
-                fi
-            done
-        elif [[ $p =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 )); then
-            ports+=("$p")
-        else
-            echo "Warning: Skipping invalid port: $p" >&2
-        fi
-    done
-
-    echo "${ports[@]}"
+die() {
+    echo "Error: $*" >&2
+    exit 1
 }
 
-# ---- Input Prompts ----
-read -rp "Enter IPs (e.g., 192.168.1.1,192.168.1.5-192.168.1.7): " input_ips
-read -rp "Enter ports (e.g., 22,80,443,8000-8005): " input_ports
+warn() {
+    if (( USE_COLOR )); then
+        printf "${YELLOW}Warning:${NC} %s\n" "$*" >&2
+    else
+        printf "Warning: %s\n" "$*" >&2
+    fi
+}
 
-hosts=($(expand_ip_range "$input_ips"))
-ports=($(expand_port_range "$input_ports"))
+trim() {
+    local value=$1
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
 
-echo -e "\nScanning...\n"
+is_uint() {
+    [[ $1 =~ ^[0-9]+$ ]]
+}
 
-# ---- Scanning Loop ----
-for host in "${hosts[@]}"; do
-    for port in "${ports[@]}"; do
-        timeout 1 bash -c "echo > /dev/tcp/$host/$port" 2>/dev/null && \
-            echo -e "${GREEN}OPEN  - $host:$port${NC}" || \
-            echo -e "${RED}CLOSED - $host:$port${NC}"
-    done
-done
+is_valid_octet() {
+    is_uint "$1" && (( 10#$1 >= 0 && 10#$1 <= 255 ))
+}
+
+is_valid_port() {
